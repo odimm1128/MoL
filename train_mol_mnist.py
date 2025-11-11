@@ -1,16 +1,15 @@
 import argparse
-from typing import Tuple, Dict
+from typing import Tuple, Dict, Optional
 
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
-from torchvision.models import resnet18, ResNet18_Weights
-from torchvision.models.feature_extraction import create_feature_extractor
+from torchvision.models import mobilenet_v3_large, MobileNet_V3_Large_Weights
 
 
 class MixtureOfLayersClassifier(nn.Module):
-    """Frozen ResNet-18 + MoE selector + three-layer MLP classifier."""
+    """Frozen MobileNetV3 + MoE selector + three-layer MLP classifier."""
 
     def __init__(
         self,
@@ -20,34 +19,29 @@ class MixtureOfLayersClassifier(nn.Module):
         top_k: int = 2,
     ) -> None:
         super().__init__()
-        weights = ResNet18_Weights.IMAGENET1K_V1
-        backbone = resnet18(weights=weights)
+        weights = MobileNet_V3_Large_Weights.IMAGENET1K_V1
+        backbone = mobilenet_v3_large(weights=weights)
 
-        # freeze backbone parameters
-        for param in backbone.parameters():
+        self.backbone = backbone.features
+        self.backbone.eval()
+        for param in self.backbone.parameters():
             param.requires_grad_(False)
 
-        return_nodes = {
-            "relu": "conv1",
-            "layer1": "layer1",
-            "layer2": "layer2",
-            "layer3": "layer3",
-            "layer4": "layer4",
-            "avgpool": "avgpool",
-        }
-        self.extractor = create_feature_extractor(backbone, return_nodes=return_nodes)
-        self.extractor.eval()
-        for param in self.extractor.parameters():
-            param.requires_grad_(False)
-
-        self.layer_names = ["conv1", "layer1", "layer2", "layer3", "layer4"]
+        # capture points across the MobileNetV3 feature stack
+        self.layer_specs = [
+            ("stage1", 1, 16),
+            ("stage2", 3, 24),
+            ("stage3", 6, 40),
+            ("stage4", 10, 80),
+            ("stage5", 15, 160),
+        ]
+        self.layer_names = [name for name, _, _ in self.layer_specs]
+        self.capture_map = {idx: name for name, idx, _ in self.layer_specs}
         channel_dims: Dict[str, int] = {
-            "conv1": 64,
-            "layer1": 64,
-            "layer2": 128,
-            "layer3": 256,
-            "layer4": 512,
+            name: channels for name, _, channels in self.layer_specs
         }
+        self.final_feature_dim = backbone.classifier[0].in_features
+        self.final_pool = nn.AdaptiveAvgPool2d(1)
 
         self.projections = nn.ModuleDict(
             {
@@ -65,7 +59,7 @@ class MixtureOfLayersClassifier(nn.Module):
         self.top_k = max(1, min(top_k, len(self.layer_names)))
         gate_hidden = hidden_dim
         self.gate = nn.Sequential(
-            nn.Linear(channel_dims["layer4"], gate_hidden),
+            nn.Linear(self.final_feature_dim, gate_hidden),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(gate_hidden, gate_hidden // 2),
@@ -83,24 +77,31 @@ class MixtureOfLayersClassifier(nn.Module):
             nn.Dropout(0.3),
             nn.Linear(hidden_dim // 2, num_classes),
         )
+        self.num_classes = num_classes
 
     def train(self, mode: bool = True) -> "MixtureOfLayersClassifier":
         super().train(mode)
         # keep the frozen backbone in eval mode so BN stats stay fixed
-        self.extractor.eval()
+        self.backbone.eval()
         return self
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, dict]:
+        captured_features: Dict[str, torch.Tensor] = {}
         with torch.no_grad():
-            features = self.extractor(x)
+            out = x
+            for idx, layer in enumerate(self.backbone):
+                out = layer(out)
+                if idx in self.capture_map:
+                    captured_features[self.capture_map[idx]] = out
+            final_features = out
 
-        gating_input = torch.flatten(features["avgpool"], 1)
+        gating_input = torch.flatten(self.final_pool(final_features), 1)
         gate_logits = self.gate(gating_input)
 
         batch_size = x.size(0)
         projected_stack = []
         for name in self.layer_names:
-            projection = self.projections[name](features[name])
+            projection = self.projections[name](captured_features[name])
             projected_stack.append(projection.unsqueeze(1))
         projected_stack = torch.cat(projected_stack, dim=1)
 
@@ -123,8 +124,9 @@ class MixtureOfLayersClassifier(nn.Module):
 def create_dataloaders(
     data_root: str, batch_size: int, num_workers: int
 ) -> Tuple[DataLoader, DataLoader]:
-    weights = ResNet18_Weights.IMAGENET1K_V1
-    mean, std = weights.meta["mean"], weights.meta["std"]
+    weights = MobileNet_V3_Large_Weights.IMAGENET1K_V1
+    preprocess = weights.transforms()
+    mean, std = preprocess.mean, preprocess.std
 
     train_transform = transforms.Compose(
         [
@@ -254,9 +256,81 @@ def format_gate_distribution(layer_names, distribution: torch.Tensor) -> str:
     )
 
 
+def save_checkpoint(
+    path: Optional[str],
+    model: MixtureOfLayersClassifier,
+    epoch: int,
+    val_acc: float,
+    args: argparse.Namespace,
+    tag: str,
+) -> None:
+    if not path:
+        return
+
+    payload = {
+        "model_state": model.state_dict(),
+        "epoch": epoch,
+        "val_acc": val_acc,
+        "config": {
+            "num_classes": getattr(model, "num_classes", 10),
+            "feature_dim": getattr(args, "feature_dim", 256),
+            "hidden_dim": getattr(args, "hidden_dim", 512),
+            "top_k": getattr(args, "top_k", 2),
+        },
+        "args": dict(vars(args)),
+        "tag": tag,
+    }
+    torch.save(payload, path)
+    print(f"  Saved {tag} checkpoint to {path}")
+
+
+def maybe_plot_learning_curve(history: Dict[str, list], output_path: Optional[str]) -> None:
+    if not output_path:
+        return
+
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except ModuleNotFoundError:
+        print(
+            "matplotlib is required for plotting learning curves. "
+            "Please install it (e.g., `pip install matplotlib`)."
+        )
+        return
+
+    epochs = range(1, len(history["train_loss"]) + 1)
+    fig, axes = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+
+    axes[0].plot(epochs, history["train_loss"], label="Train", marker="o")
+    axes[0].plot(epochs, history["val_loss"], label="Validation", marker="o")
+    axes[0].set_ylabel("Loss")
+    axes[0].legend()
+    axes[0].set_title("Learning Curve")
+
+    axes[1].plot(
+        epochs,
+        [acc * 100 for acc in history["train_acc"]],
+        label="Train",
+        marker="o",
+    )
+    axes[1].plot(
+        epochs,
+        [acc * 100 for acc in history["val_acc"]],
+        label="Validation",
+        marker="o",
+    )
+    axes[1].set_ylabel("Accuracy (%)")
+    axes[1].set_xlabel("Epoch")
+    axes[1].legend()
+
+    fig.tight_layout()
+    fig.savefig(output_path)
+    plt.close(fig)
+    print(f"Saved learning curve to {output_path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="MoE-like MNIST classifier using frozen ResNet layers"
+        description="MoE-like MNIST classifier using frozen MobileNetV3 layers"
     )
     parser.add_argument("--data-dir", type=str, default="./data")
     parser.add_argument("--batch-size", type=int, default=128)
@@ -268,6 +342,18 @@ def main() -> None:
     parser.add_argument("--hidden-dim", type=int, default=512)
     parser.add_argument("--top-k", type=int, default=2)
     parser.add_argument("--save-path", type=str, default=None)
+    parser.add_argument(
+        "--learning-curve-path",
+        type=str,
+        default=None,
+        help="Optional path to save a train/validation learning curve plot.",
+    )
+    parser.add_argument(
+        "--final-checkpoint-path",
+        type=str,
+        default=None,
+        help="Optional path to always save the last-epoch checkpoint.",
+    )
     args = parser.parse_args()
 
     torch.manual_seed(42)
@@ -297,6 +383,7 @@ def main() -> None:
     )
 
     best_acc = 0.0
+    history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
     for epoch in range(1, args.epochs + 1):
         train_loss, train_acc, train_gate = train_one_epoch(
             model, train_loader, criterion, optimizer, device
@@ -305,6 +392,11 @@ def main() -> None:
             model, test_loader, criterion, device
         )
         scheduler.step()
+
+        history["train_loss"].append(train_loss)
+        history["train_acc"].append(train_acc)
+        history["val_loss"].append(val_loss)
+        history["val_acc"].append(val_acc)
 
         print(f"Epoch {epoch:03d}/{args.epochs:03d}")
         print(
@@ -318,14 +410,26 @@ def main() -> None:
 
         if val_acc > best_acc:
             best_acc = val_acc
-            if args.save_path:
-                torch.save(
-                    {"model_state": model.state_dict(), "val_acc": val_acc},
-                    args.save_path,
-                )
-                print(f"  Saved new best checkpoint to {args.save_path}")
+            save_checkpoint(
+                args.save_path,
+                model,
+                epoch,
+                val_acc,
+                args,
+                tag="best",
+            )
 
     print(f"Finished training. Best accuracy: {best_acc*100:.2f}%")
+    final_val_acc = history["val_acc"][-1] if history["val_acc"] else 0.0
+    save_checkpoint(
+        args.final_checkpoint_path,
+        model,
+        args.epochs,
+        final_val_acc,
+        args,
+        tag="final",
+    )
+    maybe_plot_learning_curve(history, args.learning_curve_path)
 
 
 if __name__ == "__main__":

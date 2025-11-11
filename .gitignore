@@ -1,0 +1,9 @@
+# Ignore downloaded MNIST data
+data/
+
+# Ignore generated plots
+learning_curve.png
+
+# Ignore Python cache and checkpoints
+__pycache__/
+*.pth
