@@ -4,12 +4,8 @@ from typing import Tuple
 import torch
 from torch import nn
 
-from train_mol_mnist import (
-    MixtureOfLayersClassifier,
-    create_dataloaders,
-    evaluate,
-    format_gate_distribution,
-)
+from mol_core import MixtureOfLayersClassifier, evaluate, format_gate_distribution
+from train_mol_mnist import create_dataloaders
 
 
 def load_model_from_checkpoint(

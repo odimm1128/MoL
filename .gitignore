@@ -3,6 +3,7 @@ data/
 
 # Ignore generated plots
 learning_curve.png
+wm811k_predictions.csv
 
 # Ignore Python cache and checkpoints
 __pycache__/
