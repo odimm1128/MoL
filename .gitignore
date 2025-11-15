@@ -1,7 +1,7 @@
 # Ignore downloaded MNIST data
-data/
-pretrained/
-chkpts\
+data/*
+pretrained/*
+chkpts/*
 
 # Ignore Python cache and checkpoints
 __pycache__/
