@@ -1,10 +1,9 @@
 # Ignore downloaded MNIST data
 data/
-
-# Ignore generated plots
-learning_curve.png
-wm811k_predictions.csv
+pretrained/
+chkpts\
 
 # Ignore Python cache and checkpoints
 __pycache__/
 *.pth
+*.ckpt
