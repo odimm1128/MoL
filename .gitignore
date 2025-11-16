@@ -7,3 +7,4 @@ chkpts/*
 __pycache__/
 *.pth
 *.ckpt
+*.csv
