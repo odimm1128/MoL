@@ -36,17 +36,21 @@ and layers the MoL gating head on top.
      --backbone swiftformer_s \
      --learning-curve-path data/wm811k_curve.png \
      --save-path data/wm811k_best.pth \
-     --final-checkpoint-path data/wm811k_final.pth
+     --final-checkpoint-path data/wm811k_final.pth \
+     --device cuda
    ```
 
 4. Evaluate a checkpoint and emit routed-layer previews + confusion matrix:
 
-   ```bash
-   python wm811k_mol.py run \
-     --checkpoint data/wm811k_best.pth \
-     --data-root data/LSWMD.pkl \
-     --preview-samples 10
-   ```
+```bash
+python wm811k_mol.py run \
+  --checkpoint data/wm811k_best.pth \
+  --data-root data/LSWMD.pkl \
+  --limit-per-class 50 \
+  --exclude-none \
+  --preview-samples 10 \
+  --device cuda
+```
 
 During training the script reports class distributions, gate usage, and (if
 requested) learning curves. The `run` subcommand prints the WM-811K confusion
@@ -56,17 +60,22 @@ matrix, gate distribution, and per-sample routed layers, and also writes
 
 During the first run the script automatically downloads the official ImageNet
 pretrained SwiftFormer weights from the authors' Google Drive links into
-`./pretrained/swiftformer` (override via `--swiftformer-cache-dir`). These
-weights seed the frozen backbone, while the MoL gating head is still trained
-on WM-811K from scratch.
+`./pretrained/swiftformer` (override via `--swiftformer-cache-dir`). The loader
+understands both the original authors' checkpoints and the `timm` naming scheme,
+so the conversion happens automatically with no missing-key warnings. These
+weights seed the frozen backbone, while the MoL gating head is still trained on
+WM-811K from scratch.
 
 Notable WM-811K options:
 
 - `--swiftformer-cache-dir`: location to store/download the SwiftFormer weights.
-- `--limit-per-class`: cap the number of wafers per failure type for quick experiments.
+- `--limit-per-class`: cap the number of wafers per failure type for quick experiments (applies to both `train` and `run` so inference can subsample without loading the entire dataset).
 - `--val-split`: fractional split carved from the filtered dataset (default 0.1).
 - `--no-class-weights`: disable inverse-frequency weighting if you prefer raw CE loss.
 - `--image-size`: resize target fed into the frozen backbone (default 224).
 - `--predictions-csv`: path for the per-sample inference CSV.
+- `--exclude-none`: skip the explicit `['none']` wafers entirely during training or evaluation (the loader already drops truly missing labels such as `[]` / `NaN`).
+- `--amp` / `--device`: opt into mixed precision and select CUDA/CPU explicitly.
+- `--offline-backbone`: skip Google Drive download attempts when bundling your own checkpoints.
 - Unlabeled wafers tagged as `none` remain in the label space for inference, but the
   training split automatically drops them so they don't influence the weight updates.
